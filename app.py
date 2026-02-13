@@ -1,12 +1,13 @@
 # app.py
 from __future__ import annotations
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from datetime import date
+from typing import List, Optional, Dict, Any, Union
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, conint, confloat
 
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -15,26 +16,98 @@ from sklearn.metrics import mean_absolute_error, r2_score
 app = FastAPI(title="4Spice Forecast API", version="1.0")
 
 
+# -----------------------------
+# Models
+# -----------------------------
 class SalesRow(BaseModel):
-    Month: str  # "YYYY-MM-01"
+    # Make Month a real date so FastAPI validates input (prevents "string" crashing pandas)
+    Month: date = Field(..., description="Month start date in YYYY-MM-DD format (e.g., 2024-01-01)")
     Store: str
     Region: str
     Category: str
-    Promo_Flag: int
-    Discount_Pct: float
-    Marketing_Spend_USD: float
-    Avg_Unit_Price_USD: float
-    Units_Sold: int
-    Gross_Revenue_USD: float
-    Returns_Pct: float
-    Net_Sales_USD: float
-    Holiday_Flag: int
+
+    Promo_Flag: conint(ge=0, le=1) = 0
+    Discount_Pct: confloat(ge=0, le=1) = 0.0
+    Marketing_Spend_USD: confloat(ge=0) = 0.0
+
+    Avg_Unit_Price_USD: confloat(ge=0) = 0.0
+    Units_Sold: conint(ge=0) = 0
+    Gross_Revenue_USD: confloat(ge=0) = 0.0
+    Returns_Pct: confloat(ge=0, le=1) = 0.0
+    Net_Sales_USD: confloat(ge=0) = 0.0
+
+    Holiday_Flag: conint(ge=0, le=1) = 0
 
 
 class ForecastRequest(BaseModel):
-    rows: List[SalesRow]
-    forecast_year: int = 2027
-    group_by: Optional[List[str]] = None  # e.g. ["Region"] or ["Category"] or None
+    rows: List[SalesRow] = Field(..., min_length=3)
+    forecast_year: int = Field(2027, ge=2000, le=2100)
+    group_by: Optional[List[str]] = Field(
+        default=None,
+        description='Optional grouping columns. Examples: ["Region"], ["Category"], ["Store"], or null for TOTAL.'
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "forecast_year": 2027,
+                "group_by": ["Region"],
+                "rows": [
+                    {
+                        "Month": "2024-01-01",
+                        "Store": "4Spice Superstore",
+                        "Region": "Northeast",
+                        "Category": "Spices",
+                        "Promo_Flag": 1,
+                        "Discount_Pct": 0.10,
+                        "Marketing_Spend_USD": 1200,
+                        "Avg_Unit_Price_USD": 4.5,
+                        "Units_Sold": 1000,
+                        "Gross_Revenue_USD": 4500,
+                        "Returns_Pct": 0.02,
+                        "Net_Sales_USD": 4410,
+                        "Holiday_Flag": 0
+                    },
+                    {
+                        "Month": "2024-02-01",
+                        "Store": "4Spice Superstore",
+                        "Region": "Northeast",
+                        "Category": "Spices",
+                        "Promo_Flag": 0,
+                        "Discount_Pct": 0.05,
+                        "Marketing_Spend_USD": 900,
+                        "Avg_Unit_Price_USD": 4.6,
+                        "Units_Sold": 950,
+                        "Gross_Revenue_USD": 4370,
+                        "Returns_Pct": 0.02,
+                        "Net_Sales_USD": 4283,
+                        "Holiday_Flag": 0
+                    },
+                    {
+                        "Month": "2024-03-01",
+                        "Store": "4Spice Superstore",
+                        "Region": "Northeast",
+                        "Category": "Spices",
+                        "Promo_Flag": 1,
+                        "Discount_Pct": 0.12,
+                        "Marketing_Spend_USD": 1500,
+                        "Avg_Unit_Price_USD": 4.55,
+                        "Units_Sold": 1100,
+                        "Gross_Revenue_USD": 5005,
+                        "Returns_Pct": 0.02,
+                        "Net_Sales_USD": 4905,
+                        "Holiday_Flag": 0
+                    }
+                ]
+            }
+        }
+    }
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+ALLOWED_GROUP_COLS = {"Store", "Region", "Category"}
 
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -56,13 +129,36 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def normalize_month_start(dt: pd.Timestamp) -> pd.Timestamp:
+    # ensure month start
+    return pd.Timestamp(year=dt.year, month=dt.month, day=1)
+
+
+@app.get("/")
+def root() -> Dict[str, str]:
+    return {"status": "ok", "message": "4Spice Forecast API is running"}
+
+
+# -----------------------------
+# Endpoint
+# -----------------------------
 @app.post("/forecast")
 def forecast(req: ForecastRequest) -> Dict[str, Any]:
-    # Load rows -> DataFrame
-    df = pd.DataFrame([r.model_dump() for r in req.rows])
-    df["Month"] = pd.to_datetime(df["Month"]).dt.to_period("M").dt.to_timestamp()
-
+    # Validate group_by early (prevents weird key errors)
     group_cols = req.group_by or []
+    invalid = [c for c in group_cols if c not in ALLOWED_GROUP_COLS]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid group_by columns: {invalid}. Allowed: {sorted(ALLOWED_GROUP_COLS)}"
+        )
+
+    # Convert rows -> DataFrame
+    df = pd.DataFrame([r.model_dump() for r in req.rows])
+
+    # Ensure Month is at month start
+    df["Month"] = pd.to_datetime(df["Month"]).apply(normalize_month_start)
+
     agg_cols = group_cols + ["Month"]
 
     # Monthly aggregation (sum sales/marketing, mean discount, max flags)
@@ -90,22 +186,35 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
     ]
     target_col = "Net_Sales_USD"
 
+    # guardrail: need enough data to train a model
+    if len(monthly) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough monthly data after aggregation. Provide at least 3 distinct months per group."
+        )
+
     results: List[Dict[str, Any]] = []
     metrics: List[Dict[str, Any]] = []
 
     # Train separately per group (or overall)
     if group_cols:
-        groups = monthly.groupby(group_cols)
+        grouped_iter = monthly.groupby(group_cols)
     else:
-        groups = [(("TOTAL",), monthly)]
+        grouped_iter = [(("TOTAL",), monthly)]
 
-    for key, gdf in groups:
+    rng = np.random.default_rng(42)  # reproducible promo simulation
+
+    for key, gdf in grouped_iter:
         gdf = gdf.sort_values("Month_dt").reset_index(drop=True)
+
+        if len(gdf) < 3:
+            # Skip tiny groups instead of crashing
+            continue
 
         X = gdf[feature_cols].values
         y = gdf[target_col].values
 
-        # Simple split: last 6 months as test if enough history
+        # Split: last 6 months as test if enough history
         if len(gdf) >= 18:
             split = len(gdf) - 6
         else:
@@ -117,15 +226,19 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
         model = LinearRegression()
         model.fit(X_train, y_train)
 
-        y_pred = model.predict(X_test)
-        mae = float(mean_absolute_error(y_test, y_pred))
-        r2 = float(r2_score(y_test, y_pred)) if len(y_test) > 1 else None
+        # Metrics
+        mae = None
+        r2 = None
+        if len(y_test) >= 1:
+            y_pred = model.predict(X_test)
+            mae = float(mean_absolute_error(y_test, y_pred))
+            r2 = float(r2_score(y_test, y_pred)) if len(y_test) > 1 else None
 
-        # Build 12 months of forecast for requested year
+        # 12 months of forecast for requested year
         start_month = pd.Timestamp(f"{req.forecast_year}-01-01")
         future_months = pd.date_range(start_month, periods=12, freq="MS")
 
-        # Baseline future inputs from recent history
+        # baseline future inputs from recent history
         promo_rate = float(gdf["Promo_Flag"].tail(12).mean()) if len(gdf) >= 12 else float(gdf["Promo_Flag"].mean())
         disc_avg = float(gdf["Discount_Pct"].tail(12).mean()) if len(gdf) >= 12 else float(gdf["Discount_Pct"].mean())
         mkt_avg = float(gdf["Marketing_Spend_USD"].tail(12).mean()) if len(gdf) >= 12 else float(gdf["Marketing_Spend_USD"].mean())
@@ -139,8 +252,7 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
         future["month_cos"] = np.cos(2 * np.pi * future["month_num"] / 12)
         future["t"] = np.arange(t_last + 1, t_last + 13)
 
-        # baseline inputs (you can later allow users to pass these)
-        rng = np.random.default_rng(42)  # reproducible
+        # baseline inputs
         future["Promo_Flag"] = (rng.random(12) < promo_rate).astype(int)
         future["Discount_Pct"] = disc_avg
         future["Marketing_Spend_USD"] = mkt_avg
@@ -148,7 +260,13 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
 
         y_future = model.predict(future[feature_cols].values)
 
-        group_label = "TOTAL" if not group_cols else dict(zip(group_cols, key if isinstance(key, tuple) else (key,)))
+        group_label: Union[str, Dict[str, str]]
+        if not group_cols:
+            group_label = "TOTAL"
+        else:
+            # key can be a scalar if single group col
+            key_tuple = key if isinstance(key, tuple) else (key,)
+            group_label = {col: str(val) for col, val in zip(group_cols, key_tuple)}
 
         results.append(
             {
@@ -161,5 +279,11 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
         )
 
         metrics.append({"group": group_label, "MAE": mae, "R2": r2})
+
+    if not results:
+        raise HTTPException(
+            status_code=400,
+            detail="No groups had enough data to train. Provide more months per group (>=3)."
+        )
 
     return {"metrics": metrics, "results": results}
